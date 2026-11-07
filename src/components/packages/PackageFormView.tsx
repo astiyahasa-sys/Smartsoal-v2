@@ -36,6 +36,7 @@ import {
   ImageMode,
   ImagePosition,
   MultipleChoiceOptionCount,
+  QuestionItem,
   QuestionPackage,
   SchoolProfile,
   Semester,
@@ -46,6 +47,7 @@ import {
   calculateTotalQuestions,
   validatePackageForm,
   generateUniqueId,
+  autoNumberQuestions,
   MI_SUBJECTS,
   ASSESSMENT_TYPES,
   ValidationError,
@@ -53,6 +55,143 @@ import {
   scaleQuestionCountsToTotal,
 } from '../../utils/curriculum';
 import { extractErrorMessage } from '../../utils/errorParser';
+
+/**
+ * Spesifikasi setiap batch permintaan pembangkitan soal AI
+ */
+export interface QuestionBatchSpec {
+  batchIndex: number;
+  batchNumber: number;
+  totalBatches: number;
+  multipleChoiceCount: number;
+  complexMultipleChoiceCount: number;
+  shortAnswerCount: number;
+  essayCount: number;
+  totalQuestions: number;
+  description: string;
+}
+
+/**
+ * Status progres sequential batching yang sedang berjalan
+ */
+export interface BatchProgressState {
+  totalBatches: number;
+  currentBatchIndex: number;
+  completedBatches: number;
+  totalTargetQuestions: number;
+  generatedQuestionsCount: number;
+  currentBatchDescription: string;
+  stageMessage: string;
+  percent: number;
+}
+
+export function formatBatchDescription(mc: number, cmc: number, sa: number, es: number): string {
+  const parts: string[] = [];
+  if (mc > 0) parts.push(`${mc} Pilihan Ganda`);
+  if (cmc > 0) parts.push(`${cmc} PG Kompleks`);
+  if (sa > 0) parts.push(`${sa} Isian`);
+  if (es > 0) parts.push(`${es} Uraian`);
+  return parts.join(', ') || '0 Butir';
+}
+
+/**
+ * Membagi target butir soal asesmen menjadi batch-batch kecil (maksimal 15 butir per batch)
+ * untuk menghindari batas waktu eksekusi Vercel Serverless (HTTP 504).
+ * Mempertahankan komposisi jenis soal secara tepat (PG -> PG Kompleks -> Isian -> Uraian).
+ */
+export function planQuestionBatches(
+  multipleChoiceCount: number,
+  complexMultipleChoiceCount: number,
+  shortAnswerCount: number,
+  essayCount: number,
+  maxPerBatch: number = 15
+): QuestionBatchSpec[] {
+  const mc = Math.max(0, Math.floor(Number(multipleChoiceCount) || 0));
+  const cmc = Math.max(0, Math.floor(Number(complexMultipleChoiceCount) || 0));
+  const sa = Math.max(0, Math.floor(Number(shortAnswerCount) || 0));
+  const es = Math.max(0, Math.floor(Number(essayCount) || 0));
+  const total = mc + cmc + sa + es;
+
+  if (total <= 0) return [];
+
+  // Jika total <= 15: gunakan 1 batch tunggal tanpa batching bertingkat
+  if (total <= maxPerBatch) {
+    return [
+      {
+        batchIndex: 0,
+        batchNumber: 1,
+        totalBatches: 1,
+        multipleChoiceCount: mc,
+        complexMultipleChoiceCount: cmc,
+        shortAnswerCount: sa,
+        essayCount: es,
+        totalQuestions: total,
+        description: formatBatchDescription(mc, cmc, sa, es),
+      },
+    ];
+  }
+
+  // Jika total > 15: bagi secara sekuensial dengan batas max 15 per batch
+  // Mengikuti tata urutan standar: PG -> PG Kompleks -> Isian -> Uraian
+  let remMC = mc;
+  let remCMC = cmc;
+  let remSA = sa;
+  let remES = es;
+
+  const rawBatches: Array<{
+    mc: number;
+    cmc: number;
+    sa: number;
+    es: number;
+    total: number;
+  }> = [];
+
+  while (remMC > 0 || remCMC > 0 || remSA > 0 || remES > 0) {
+    let capacity = maxPerBatch;
+
+    const takeMC = Math.min(remMC, capacity);
+    capacity -= takeMC;
+    remMC -= takeMC;
+
+    const takeCMC = Math.min(remCMC, capacity);
+    capacity -= takeCMC;
+    remCMC -= takeCMC;
+
+    const takeSA = Math.min(remSA, capacity);
+    capacity -= takeSA;
+    remSA -= takeSA;
+
+    const takeES = Math.min(remES, capacity);
+    capacity -= takeES;
+    remES -= takeES;
+
+    const batchTotal = takeMC + takeCMC + takeSA + takeES;
+    if (batchTotal > 0) {
+      rawBatches.push({
+        mc: takeMC,
+        cmc: takeCMC,
+        sa: takeSA,
+        es: takeES,
+        total: batchTotal,
+      });
+    } else {
+      break;
+    }
+  }
+
+  const totalBatches = rawBatches.length;
+  return rawBatches.map((b, idx) => ({
+    batchIndex: idx,
+    batchNumber: idx + 1,
+    totalBatches,
+    multipleChoiceCount: b.mc,
+    complexMultipleChoiceCount: b.cmc,
+    shortAnswerCount: b.sa,
+    essayCount: b.es,
+    totalQuestions: b.total,
+    description: formatBatchDescription(b.mc, b.cmc, b.sa, b.es),
+  }));
+}
 
 interface PackageFormViewProps {
   packageToEdit: QuestionPackage | null;
@@ -179,6 +318,12 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
   const [isDirty, setIsDirty] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // State untuk Sequential Batching Pembangkitan Soal
+  const [batchProgress, setBatchProgress] = useState<BatchProgressState | null>(null);
+  const [accumulatedBatchQuestions, setAccumulatedBatchQuestions] = useState<QuestionItem[]>([]);
+  const [failedBatchIndex, setFailedBatchIndex] = useState<number | null>(null);
+  const [batchPackageTitle, setBatchPackageTitle] = useState<string>('');
+
   // Auto calculate phase based on grade
   const phase = useMemo(() => getPhaseByGrade(grade), [grade]);
 
@@ -194,6 +339,17 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
     () => calculateTotalQuestions(multipleChoiceCount, shortAnswerCount, essayCount, complexMultipleChoiceCount),
     [multipleChoiceCount, shortAnswerCount, essayCount, complexMultipleChoiceCount]
   );
+
+  // Rencana pembagian batching otomatis jika total butir soal > 15
+  const batchPlan = useMemo(() => {
+    return planQuestionBatches(
+      multipleChoiceCount,
+      complexMultipleChoiceCount || 0,
+      shortAnswerCount,
+      essayCount,
+      15
+    );
+  }, [multipleChoiceCount, complexMultipleChoiceCount, shortAnswerCount, essayCount]);
 
   // Estimasi total skor maksimal naskah
   const estimatedMaxScore = useMemo(() => {
@@ -459,6 +615,9 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
     }
     setValidationErrors([]);
     setGenerationError(null);
+    setFailedBatchIndex(null);
+    setAccumulatedBatchQuestions([]);
+    setBatchProgress(null);
     setShowConfirmModal(true);
   };
 
@@ -468,7 +627,36 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
     }
     setIsGenerating(false);
     setGenerationStage('');
+    setBatchProgress(null);
     setShowConfirmModal(false);
+  };
+
+  /**
+   * Jika batch gagal di tengah jalan namun beberapa batch awal sudah berhasil menghasilkan soal,
+   * guru dapat memilih melanjutkan ke Editor Soal dengan butir-butir yang sudah tersusun
+   * tanpa kehilangan hasil sementara.
+   */
+  const handleProceedWithPartialQuestions = () => {
+    if (accumulatedBatchQuestions.length === 0) return;
+    const numbered = autoNumberQuestions(accumulatedBatchQuestions);
+    const pkg = buildPackageObject();
+    const partialPkg: QuestionPackage = {
+      ...pkg,
+      title: batchPackageTitle || pkg.title,
+      questions: numbered,
+      status: 'completed',
+      updatedAt: new Date().toISOString(),
+    };
+    setShowConfirmModal(false);
+    setIsGenerating(false);
+    setBatchProgress(null);
+    setAccumulatedBatchQuestions([]);
+    setFailedBatchIndex(null);
+    if (onOpenEditor) {
+      onOpenEditor(partialPkg);
+    } else {
+      onSave(partialPkg, true);
+    }
   };
 
   /**
@@ -531,133 +719,278 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
     return extractErrorMessage(dataOrError, statusCode);
   };
 
-  const handleExecuteAiGeneration = async () => {
+  /**
+   * Eksekusi Pembangkitan Soal AI:
+   * - Jika total soal <= 15: Berjalan dalam 1 request tunggal (alur asli dipertahankan).
+   * - Jika total soal > 15: Berjalan dalam Sequential Batching (setiap batch maksimal 15 butir).
+   * - Parameter startIndex memungkinkan mencoba kembali (retry) HANYA batch yang gagal tanpa mengulang batch yang berhasil.
+   */
+  const handleExecuteAiGeneration = async (startIndex: number = 0) => {
     const pkg = buildPackageObject();
     setIsGenerating(true);
     setGenerationError(null);
-    setGenerationStage('Menghubungkan ke server dan model Gemini AI...');
+    setFailedBatchIndex(null);
 
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
+    // KASUS 1: Total soal <= 15 butir (Alur Asli Tunggal)
+    if (batchPlan.length <= 1) {
+      setBatchProgress(null);
+      setGenerationStage('Menghubungkan ke server dan model Gemini AI...');
 
-    // Timeout keamanan di sisi klien (58 detik, tepat sebelum batas Vercel Hobby 60 detik)
-    const clientTimeoutTimer = setTimeout(() => {
-      controller.abort();
-    }, 58000);
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
 
-    const stageTimer1 = setTimeout(() => {
-      setGenerationStage('Menyusun butir pertanyaan, stimulus kontekstual MI, dan opsi jawaban...');
-    }, 2500);
+      // Timeout keamanan di sisi klien (58 detik, tepat sebelum batas Vercel Hobby 60 detik)
+      const clientTimeoutTimer = setTimeout(() => {
+        controller.abort();
+      }, 58000);
 
-    const stageTimer2 = setTimeout(() => {
-      setGenerationStage('Memvalidasi kunci jawaban, pembahasan guru, dan rubrik penskoran...');
-    }, 6000);
+      const stageTimer1 = setTimeout(() => {
+        setGenerationStage('Menyusun butir pertanyaan, stimulus kontekstual MI, dan opsi jawaban...');
+      }, 2500);
 
-    const stageTimer3 = setTimeout(() => {
-      setGenerationStage('Model AI sedang memformulasikan naskah asesmen lengkap (paket besar membutuhkan waktu ekstra)...');
-    }, 12000);
+      const stageTimer2 = setTimeout(() => {
+        setGenerationStage('Memvalidasi kunci jawaban, pembahasan guru, dan rubrik penskoran...');
+      }, 6000);
 
-    const stageTimer4 = setTimeout(() => {
-      setGenerationStage('Tahap akhir penyusunan naskah asesmen dan verifikasi kelayakan Kurikulum Merdeka...');
-    }, 22000);
+      const stageTimer3 = setTimeout(() => {
+        setGenerationStage('Model AI sedang memformulasikan naskah asesmen lengkap...');
+      }, 12000);
 
-    const cleanupTimers = () => {
-      clearTimeout(clientTimeoutTimer);
-      clearTimeout(stageTimer1);
-      clearTimeout(stageTimer2);
-      clearTimeout(stageTimer3);
-      clearTimeout(stageTimer4);
-    };
+      const stageTimer4 = setTimeout(() => {
+        setGenerationStage('Tahap akhir penyusunan naskah asesmen dan verifikasi kelayakan Kurikulum Merdeka...');
+      }, 22000);
 
-    try {
-      const response = await fetch('/api/generate-questions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify(pkg),
-        signal: controller.signal,
-      });
-
-      cleanupTimers();
-
-      const contentType = response.headers.get('content-type') || '';
-      const rawText = await response.text();
-
-      // Pemeriksaan jika server mengembalikan halaman HTML alih-alih data JSON (misal Vercel error page atau rewrite)
-      if (contentType.includes('text/html') || rawText.trim().startsWith('<')) {
-        console.error('[Diagnostik API /api/generate-questions] Server mengembalikan HTML:', {
-          status: response.status,
-          statusText: response.statusText,
-          contentType,
-          url: response.url,
-          bodySnippet: rawText.substring(0, 300),
-        });
-
-        if (response.status === 404) {
-          throw new Error('Endpoint API /api/generate-questions tidak ditemukan (HTTP 404). Pastikan server backend Vercel aktif.');
-        } else if (response.status === 502 || response.status === 504) {
-          throw new Error(`Server gateway mengalami batas waktu (HTTP ${response.status}). Coba kurangi jumlah butir soal lalu ulangi.`);
-        } else if (response.status === 302 || rawText.includes('__cookie_check')) {
-          throw new Error('Sesi pratinjau lingkungan sedang memverifikasi cookie akses. Silakan muat ulang (refresh) halaman lalu coba kembali.');
-        } else {
-          throw new Error(
-            `Server mengembalikan respons halaman web (HTTP ${response.status}) alih-alih data JSON. Kemungkinan terjadi error internal serverless. Silakan coba kembali.`
-          );
-        }
-      }
-
-      if (!rawText.trim()) {
-        throw new Error(`Server mengembalikan respons kosong (HTTP ${response.status}).`);
-      }
-
-      let data: any;
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        console.error('[Diagnostik API] Format respons bukan JSON valid:', rawText.substring(0, 300));
-        throw new Error(`Gagal membaca respons dari server (HTTP ${response.status}): Format data tidak valid.`);
-      }
-
-      if (!response.ok || !data.success) {
-        // Ekstraksi pesan error aman: jika error berupa objek, tampilkan properti 'message' atau 'error' miliknya alih-alih '[object Object]'
-        const safeErrorMessage = parseApiErrorResponse(data, response.status);
-        throw new Error(safeErrorMessage);
-      }
-
-      if (!Array.isArray(data.questions) || data.questions.length === 0) {
-        throw new Error('Tidak ada butir soal yang berhasil digenerate.');
-      }
-
-      const updatedPackage: QuestionPackage = {
-        ...pkg,
-        title: data.packageTitle || pkg.title,
-        questions: data.questions,
-        status: 'completed',
-        updatedAt: new Date().toISOString(),
+      const cleanupTimers = () => {
+        clearTimeout(clientTimeoutTimer);
+        clearTimeout(stageTimer1);
+        clearTimeout(stageTimer2);
+        clearTimeout(stageTimer3);
+        clearTimeout(stageTimer4);
       };
 
-      setIsGenerating(false);
-      setShowConfirmModal(false);
+      try {
+        const response = await fetch('/api/generate-questions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(pkg),
+          signal: controller.signal,
+        });
 
-      if (onOpenEditor) {
-        onOpenEditor(updatedPackage);
-      } else {
-        onSave(updatedPackage, true);
+        cleanupTimers();
+
+        const contentType = response.headers.get('content-type') || '';
+        const rawText = await response.text();
+
+        if (contentType.includes('text/html') || rawText.trim().startsWith('<')) {
+          if (response.status === 404) {
+            throw new Error('Endpoint API /api/generate-questions tidak ditemukan (HTTP 404). Pastikan server backend Vercel aktif.');
+          } else if (response.status === 502 || response.status === 504) {
+            throw new Error(`Server gateway mengalami batas waktu (HTTP ${response.status}). Coba kurangi jumlah butir soal lalu ulangi.`);
+          } else {
+            throw new Error(`Server mengembalikan respons halaman web (HTTP ${response.status}) alih-alih data JSON.`);
+          }
+        }
+
+        if (!rawText.trim()) {
+          throw new Error(`Server mengembalikan respons kosong (HTTP ${response.status}).`);
+        }
+
+        let data: any;
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          throw new Error(`Gagal membaca respons dari server (HTTP ${response.status}): Format data tidak valid.`);
+        }
+
+        if (!response.ok || !data.success) {
+          const safeErrorMessage = parseApiErrorResponse(data, response.status);
+          throw new Error(safeErrorMessage);
+        }
+
+        if (!Array.isArray(data.questions) || data.questions.length === 0) {
+          throw new Error('Tidak ada butir soal yang berhasil digenerate.');
+        }
+
+        const updatedPackage: QuestionPackage = {
+          ...pkg,
+          title: data.packageTitle || pkg.title,
+          questions: autoNumberQuestions(data.questions),
+          status: 'completed',
+          updatedAt: new Date().toISOString(),
+        };
+
+        setIsGenerating(false);
+        setShowConfirmModal(false);
+
+        if (onOpenEditor) {
+          onOpenEditor(updatedPackage);
+        } else {
+          onSave(updatedPackage, true);
+        }
+      } catch (err: any) {
+        cleanupTimers();
+
+        if (err.name === 'AbortError') {
+          setGenerationError('Waktu pemrosesan melebihi batas waktu tunggu (timeout). Coba kurangi jumlah butir soal per sesi atau buat per bab.');
+        } else {
+          const safeError = parseApiErrorResponse(err);
+          setGenerationError(safeError);
+
+          const lowerErr = (safeError + ' ' + (err?.message || '')).toLowerCase();
+          if (
+            lowerErr.includes('429') ||
+            lowerErr.includes('kuota') ||
+            lowerErr.includes('quota') ||
+            lowerErr.includes('frekuensi') ||
+            lowerErr.includes('resource_exhausted')
+          ) {
+            setRetryCountdown(45);
+          }
+        }
+        setIsGenerating(false);
       }
-    } catch (err: any) {
-      cleanupTimers();
+      return;
+    }
 
-      if (err.name === 'AbortError') {
-        setGenerationError('Waktu pemrosesan melebihi batas waktu tunggu (timeout). Untuk paket dengan 35 butir soal atau lebih, Anda dapat mencoba mengurangi jumlah butir soal per sesi atau buat per lingkup materi.');
-      } else {
-        // Parsing aman error yang tertangkap agar tidak pernah menampilkan [object Object]
-        const safeError = parseApiErrorResponse(err);
-        setGenerationError(safeError);
+    // KASUS 2: Total soal > 15 butir (Sequential Batching)
+    let currentAccumulator: QuestionItem[] = startIndex === 0 ? [] : [...accumulatedBatchQuestions];
+    let latestPackageTitle = batchPackageTitle || pkg.title;
 
-        // Jika terdeteksi batas kuota/rate limit 429, mulai hitung mundur cooldown 45 detik
-        const lowerErr = (safeError + ' ' + (err?.message || '')).toLowerCase();
+    for (let i = startIndex; i < batchPlan.length; i++) {
+      const batch = batchPlan[i];
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      // Timeout aman per batch (50 detik, cukup lapang untuk 15 soal yang rata-rata selesai dalam 15-20 detik)
+      const batchTimeout = setTimeout(() => {
+        controller.abort();
+      }, 50000);
+
+      const doneCount = currentAccumulator.length;
+      const initialPercent = Math.min(95, Math.round((doneCount / totalQuestions) * 100));
+
+      setBatchProgress({
+        totalBatches: batchPlan.length,
+        currentBatchIndex: i,
+        completedBatches: i,
+        totalTargetQuestions: totalQuestions,
+        generatedQuestionsCount: doneCount,
+        currentBatchDescription: batch.description,
+        stageMessage: `Sedang menyusun Batch ${batch.batchNumber} dari ${batchPlan.length} (${batch.description})...`,
+        percent: initialPercent,
+      });
+
+      setGenerationStage(
+        `Batch ${batch.batchNumber} dari ${batchPlan.length}: Menyusun ${batch.description} (${doneCount}/${totalQuestions} butir selesai)...`
+      );
+
+      try {
+        const batchPkg: QuestionPackage = {
+          ...pkg,
+          multipleChoiceCount: batch.multipleChoiceCount,
+          complexMultipleChoiceCount: batch.complexMultipleChoiceCount,
+          shortAnswerCount: batch.shortAnswerCount,
+          essayCount: batch.essayCount,
+          additionalNotes: pkg.additionalNotes
+            ? `${pkg.additionalNotes} (Bagian ${batch.batchNumber} dari ${batchPlan.length}: ${batch.description})`
+            : `(Bagian ${batch.batchNumber} dari ${batchPlan.length}: ${batch.description})`,
+        };
+
+        const response = await fetch('/api/generate-questions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(batchPkg),
+          signal: controller.signal,
+        });
+
+        clearTimeout(batchTimeout);
+
+        const contentType = response.headers.get('content-type') || '';
+        const rawText = await response.text();
+
+        if (contentType.includes('text/html') || rawText.trim().startsWith('<')) {
+          if (response.status === 404) {
+            throw new Error(`Endpoint API /api/generate-questions tidak ditemukan (HTTP 404). Pastikan server backend Vercel aktif.`);
+          } else if (response.status === 502 || response.status === 504) {
+            throw new Error(`Server gateway mengalami batas waktu (HTTP ${response.status}) pada Batch ${batch.batchNumber}.`);
+          } else {
+            throw new Error(`Server mengembalikan respons halaman web (HTTP ${response.status}) pada Batch ${batch.batchNumber}.`);
+          }
+        }
+
+        if (!rawText.trim()) {
+          throw new Error(`Server mengembalikan respons kosong (HTTP ${response.status}) pada Batch ${batch.batchNumber}.`);
+        }
+
+        let data: any;
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          throw new Error(`Gagal membaca respons dari server (HTTP ${response.status}) pada Batch ${batch.batchNumber}: Format data tidak valid.`);
+        }
+
+        if (!response.ok || !data.success) {
+          const safeErrorMessage = parseApiErrorResponse(data, response.status);
+          throw new Error(safeErrorMessage);
+        }
+
+        if (!Array.isArray(data.questions) || data.questions.length === 0) {
+          throw new Error(`Tidak ada butir soal yang berhasil digenerate pada Batch ${batch.batchNumber}.`);
+        }
+
+        if (data.questions.length !== batch.totalQuestions) {
+          throw new Error(
+            `Jumlah butir soal Batch ${batch.batchNumber} tidak sesuai. Diharapkan ${batch.totalQuestions} butir, model menghasilkan ${data.questions.length} butir.`
+          );
+        }
+
+        if (data.packageTitle) {
+          latestPackageTitle = data.packageTitle;
+          setBatchPackageTitle(data.packageTitle);
+        }
+
+        // Akumulasi butir soal secara sekuensial
+        currentAccumulator = [...currentAccumulator, ...data.questions];
+        setAccumulatedBatchQuestions(currentAccumulator);
+
+        const updatedDoneCount = currentAccumulator.length;
+        const isAllDone = i === batchPlan.length - 1;
+
+        setBatchProgress({
+          totalBatches: batchPlan.length,
+          currentBatchIndex: isAllDone ? i : i + 1,
+          completedBatches: i + 1,
+          totalTargetQuestions: totalQuestions,
+          generatedQuestionsCount: updatedDoneCount,
+          currentBatchDescription: isAllDone ? 'Semua Batch Selesai' : batchPlan[i + 1]?.description || '',
+          stageMessage: isAllDone
+            ? `Seluruh ${updatedDoneCount} dari ${totalQuestions} butir soal selesai disusun!`
+            : `Batch ${batch.batchNumber} selesai (${updatedDoneCount}/${totalQuestions} butir). Menyiapkan Batch ${batch.batchNumber + 1}...`,
+          percent: isAllDone ? 100 : Math.min(95, Math.round((updatedDoneCount / totalQuestions) * 100)),
+        });
+
+      } catch (batchErr: any) {
+        clearTimeout(batchTimeout);
+        setFailedBatchIndex(i);
+        setIsGenerating(false);
+
+        let errorMsg = '';
+        if (batchErr.name === 'AbortError') {
+          errorMsg = `Waktu pemrosesan Batch ${batch.batchNumber} (${batch.description}) melebihi batas waktu tunggu server (50 detik).`;
+        } else {
+          errorMsg = parseApiErrorResponse(batchErr);
+        }
+
+        const fullErrMsg = `Batch ${batch.batchNumber} dari ${batchPlan.length} (${batch.description}) gagal: ${errorMsg}`;
+        setGenerationError(fullErrMsg);
+
+        const lowerErr = (fullErrMsg + ' ' + (batchErr?.message || '')).toLowerCase();
         if (
           lowerErr.includes('429') ||
           lowerErr.includes('kuota') ||
@@ -667,8 +1000,52 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
         ) {
           setRetryCountdown(45);
         }
+        return; // Hentikan batch berikutnya seketika
       }
-      setIsGenerating(false);
+    }
+
+    // Seluruh batch berhasil!
+    // Gabungkan, pastikan ID unik tanpa duplikasi, dan beri penomoran berurutan 1..N
+    const seenIds = new Set<string>();
+    const sanitizedQuestions: QuestionItem[] = currentAccumulator.map((q, idx) => {
+      const itemNumber = idx + 1;
+      let id = q.id;
+      if (!id || seenIds.has(id)) {
+        id = `q_${Date.now()}_${itemNumber}_${Math.random().toString(36).substring(2, 6)}`;
+      }
+      seenIds.add(id);
+
+      let newCaption = q.imageCaption;
+      if (newCaption && /^Gambar Soal Nomor \d+$/i.test(newCaption.trim())) {
+        newCaption = `Gambar Soal Nomor ${itemNumber}`;
+      }
+
+      return {
+        ...q,
+        id,
+        number: itemNumber,
+        imageCaption: newCaption,
+      };
+    });
+
+    const updatedPackage: QuestionPackage = {
+      ...pkg,
+      title: latestPackageTitle || pkg.title,
+      questions: sanitizedQuestions,
+      status: 'completed',
+      updatedAt: new Date().toISOString(),
+    };
+
+    setIsGenerating(false);
+    setShowConfirmModal(false);
+    setBatchProgress(null);
+    setAccumulatedBatchQuestions([]);
+    setFailedBatchIndex(null);
+
+    if (onOpenEditor) {
+      onOpenEditor(updatedPackage);
+    } else {
+      onSave(updatedPackage, true);
     }
   };
   const handleReset = () => {
@@ -2320,6 +2697,30 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
                 </div>
               </div>
 
+              {/* Rincian Sequential Batching Otomatis untuk Paket > 15 Soal */}
+              {batchPlan.length > 1 && !isGenerating && (
+                <div className="p-3.5 rounded-xl bg-teal-50/90 border border-teal-200 text-teal-950 text-xs space-y-2 shadow-2xs">
+                  <div className="flex items-center gap-1.5 font-bold text-teal-900">
+                    <Sparkles className="w-3.5 h-3.5 text-teal-700" />
+                    <span>Sequential Batching Otomatis ({batchPlan.length} Tahap):</span>
+                  </div>
+                  <p className="text-[11px] text-teal-800 leading-relaxed">
+                    Karena Anda menyusun <strong>{totalQuestions} butir soal</strong>, sistem otomatis memprosesnya dalam <strong>{batchPlan.length} batch berurutan</strong> (maksimal 15 butir per batch) agar durasi setiap tahap hanya 15–20 detik dan terhindar dari batas waktu serverless (HTTP 504):
+                  </p>
+                  <div className="space-y-1 pt-0.5">
+                    {batchPlan.map((b) => (
+                      <div
+                        key={b.batchIndex}
+                        className="flex items-center justify-between bg-white/80 px-2.5 py-1.5 rounded-lg border border-teal-100 text-[11px]"
+                      >
+                        <span className="font-semibold text-teal-900">Batch {b.batchNumber}:</span>
+                        <span className="text-slate-700">{b.description} ({b.totalQuestions} butir)</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Peringatan Privasi dan Transmisi Data */}
               <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-[11px] text-amber-900 leading-relaxed">
                 <strong>Pemberitahuan Transmisi:</strong> Data rancangan asesmen dan ringkasan materi di atas akan dikirimkan ke layanan Google Gemini melalui backend aplikasi ini untuk diproses menjadi butir soal. Tidak ada kunci API yang terpapar ke peramban.
@@ -2328,7 +2729,70 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
               {/* Error Message */}
               {generationError && (
                 <div className="space-y-3">
-                  {/429|kuota|quota|frekuensi|RESOURCE_EXHAUSTED/i.test(generationError) || retryCountdown > 0 ? (
+                  {failedBatchIndex !== null && batchPlan[failedBatchIndex] ? (
+                    <div className="p-4 rounded-xl bg-rose-50/90 border border-rose-300 text-rose-950 text-xs space-y-3 shadow-xs">
+                      <div className="flex items-start gap-2.5">
+                        <div className="p-1.5 rounded-lg bg-rose-200 text-rose-900 shrink-0 mt-0.5">
+                          <AlertCircle className="w-4 h-4" />
+                        </div>
+                        <div className="space-y-1">
+                          <h4 className="font-bold text-rose-950 text-xs">
+                            Batch {failedBatchIndex + 1} dari {batchPlan.length} Mengalami Kendala
+                          </h4>
+                          <p className="text-[11px] text-rose-900 leading-relaxed">
+                            {generationError}
+                          </p>
+                          {accumulatedBatchQuestions.length > 0 && (
+                            <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900 text-[11px] space-y-1 mt-2">
+                              <span className="font-bold flex items-center gap-1.5 text-emerald-800">
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                <span>{accumulatedBatchQuestions.length} Butir Soal Sebelumnya Tersimpan Aman</span>
+                              </span>
+                              <p className="text-[10.5px] text-emerald-700 leading-relaxed">
+                                Anda dapat mengklik tombol <strong>&quot;Coba Lagi Batch {failedBatchIndex + 1} Saja&quot;</strong> tanpa mengulang batch yang sudah berhasil, atau langsung membuka Editor Soal dengan {accumulatedBatchQuestions.length} butir yang telah tersusun.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="pt-1 flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleExecuteAiGeneration(failedBatchIndex)}
+                          disabled={retryCountdown > 0}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white font-bold text-xs transition shadow-xs"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>
+                            {retryCountdown > 0
+                              ? `Tunggu (${retryCountdown}s)`
+                              : `Coba Lagi Batch ${failedBatchIndex + 1} Saja (${batchPlan[failedBatchIndex].description})`}
+                          </span>
+                        </button>
+
+                        {accumulatedBatchQuestions.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={handleProceedWithPartialQuestions}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white font-bold text-xs transition shadow-xs"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span>Gunakan {accumulatedBatchQuestions.length} Soal & Buka Editor</span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => handleExecuteAiGeneration(0)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs transition shadow-xs"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Ulangi dari Awal (Batch 1)</span>
+                        </button>
+                      </div>
+                    </div>
+                  ) : /429|kuota|quota|frekuensi|RESOURCE_EXHAUSTED/i.test(generationError) || retryCountdown > 0 ? (
                     <div className="p-4 rounded-xl bg-amber-50/90 border border-amber-300 text-amber-950 text-xs space-y-3 shadow-xs">
                       <div className="flex items-start gap-2.5">
                         <div className="p-1.5 rounded-lg bg-amber-200/80 text-amber-900 shrink-0 mt-0.5">
@@ -2530,17 +2994,81 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
 
               {/* Progress Bar & Stage Indicator */}
               {isGenerating && (
-                <div className="p-4 rounded-xl bg-teal-50/70 border border-teal-200 space-y-2.5">
-                  <div className="flex items-center gap-2 text-xs font-bold text-teal-900">
-                    <Loader2 className="w-4 h-4 text-teal-600 animate-spin" />
-                    <span>Sedang Memproses...</span>
+                <div className="p-4 rounded-xl bg-teal-50/80 border border-teal-200 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-xs font-bold text-teal-950">
+                      <Loader2 className="w-4 h-4 text-teal-600 animate-spin" />
+                      <span>
+                        {batchProgress
+                          ? `Menyusun Soal (Batch ${batchProgress.currentBatchIndex + 1} dari ${batchProgress.totalBatches})`
+                          : 'Sedang Memproses...'}
+                      </span>
+                    </div>
+                    {batchProgress && (
+                      <span className="text-xs font-extrabold text-teal-800 bg-teal-100/90 border border-teal-200 px-2 py-0.5 rounded-full">
+                        {batchProgress.percent}%
+                      </span>
+                    )}
                   </div>
-                  <p className="text-xs text-teal-800 animate-pulse">
+
+                  <p className="text-xs text-teal-800 leading-relaxed">
                     {generationStage || 'Memproses permintaan pembuatan soal...'}
                   </p>
-                  <div className="w-full bg-teal-200/60 rounded-full h-1.5 overflow-hidden">
-                    <div className="bg-teal-600 h-1.5 rounded-full animate-indeterminate" style={{ width: '60%' }} />
+
+                  {/* Real Progress Bar */}
+                  <div className="w-full bg-teal-200/60 rounded-full h-2 overflow-hidden">
+                    <div
+                      className="bg-teal-600 h-2 rounded-full transition-all duration-500 ease-out"
+                      style={{
+                        width: batchProgress
+                          ? `${Math.max(6, batchProgress.percent)}%`
+                          : '60%',
+                      }}
+                    />
                   </div>
+
+                  {/* Batch Status Checklist (jika total soal > 15) */}
+                  {batchPlan.length > 1 && (
+                    <div className="pt-2 border-t border-teal-200/80 space-y-1.5">
+                      <span className="text-[11px] font-bold text-teal-900 block">
+                        Rincian Alur Batching (Batas Aman Serverless Vercel):
+                      </span>
+                      <div className="space-y-1">
+                        {batchPlan.map((b, bIdx) => {
+                          const isCompleted = (batchProgress?.completedBatches ?? 0) > bIdx;
+                          const isCurrent = (batchProgress?.currentBatchIndex ?? 0) === bIdx && isGenerating;
+                          return (
+                            <div
+                              key={bIdx}
+                              className={`flex items-center justify-between text-[11px] px-2.5 py-1.5 rounded-lg transition-colors ${
+                                isCompleted
+                                  ? 'bg-emerald-100/70 text-emerald-900 font-semibold'
+                                  : isCurrent
+                                  ? 'bg-teal-100 text-teal-950 font-bold border border-teal-300'
+                                  : 'bg-white/60 text-slate-500'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2">
+                                {isCompleted ? (
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                ) : isCurrent ? (
+                                  <Loader2 className="w-3.5 h-3.5 text-teal-700 animate-spin shrink-0" />
+                                ) : (
+                                  <span className="w-3.5 h-3.5 rounded-full border border-slate-300 inline-block shrink-0" />
+                                )}
+                                <span>
+                                  Batch {b.batchNumber}: {b.description} ({b.totalQuestions} butir)
+                                </span>
+                              </div>
+                              <span className="text-[10px] font-medium">
+                                {isCompleted ? 'Selesai' : isCurrent ? 'Sedang Diproses...' : 'Menunggu Antrean'}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -2548,7 +3076,11 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
             {/* Modal Sticky Footer Actions */}
             <div className="px-6 py-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between gap-3 shrink-0">
               <span className="text-[11px] text-slate-500 hidden sm:inline">
-                {isGenerating ? 'Mohon tunggu hingga selesai...' : 'Pilih opsi di atas atau coba kembali.'}
+                {isGenerating
+                  ? batchPlan.length > 1
+                    ? `Memproses batch bertahap (aman dari timeout 60s)...`
+                    : 'Mohon tunggu hingga selesai...'
+                  : 'Pilih opsi di atas atau coba kembali.'}
               </span>
 
               <div className="flex items-center justify-end gap-2.5 ml-auto w-full sm:w-auto">
@@ -2571,7 +3103,7 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
                     </button>
                     <button
                       type="button"
-                      onClick={handleExecuteAiGeneration}
+                      onClick={() => handleExecuteAiGeneration(failedBatchIndex !== null ? failedBatchIndex : 0)}
                       disabled={retryCountdown > 0}
                       className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold text-xs shadow-md transition"
                     >
@@ -2579,8 +3111,12 @@ export const PackageFormView: React.FC<PackageFormViewProps> = ({
                       <span>
                         {retryCountdown > 0
                           ? `Coba Lagi (${retryCountdown}s)`
+                          : failedBatchIndex !== null
+                          ? `Coba Lagi Batch ${failedBatchIndex + 1}`
                           : generationError
                           ? 'Coba Lagi'
+                          : batchPlan.length > 1
+                          ? `Mulai Generate (${batchPlan.length} Batch Bertahap)`
                           : 'Mulai Generate Soal'}
                       </span>
                     </button>
