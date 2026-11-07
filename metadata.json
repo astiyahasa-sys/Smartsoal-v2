@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix MADRASAH SMART SOAL",
+  "description": "Aplikasi Penyusunan Soal untuk Guru Madrasah Ibtidaiyah (MI) di Indonesia.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
